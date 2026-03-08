@@ -1,0 +1,8 @@
+pymupdf
+google-genai
+chromadb
+sentence-transformers
+Pillow
+fastapi
+uvicorn
+python-multipart
