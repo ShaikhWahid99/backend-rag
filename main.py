@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import shutil
@@ -13,6 +13,9 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 app = FastAPI()
+
+if not os.path.exists("uploads"):
+    os.makedirs("uploads")
 
 app.add_middleware(
     CORSMiddleware,
@@ -59,6 +62,15 @@ async def list_files():
                     "created_at": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stats.st_ctime))
                 })
     return files
+
+
+@app.delete("/files/{filename}")
+async def delete_file(filename: str):
+    path = os.path.join("uploads", filename)
+    if os.path.exists(path):
+        os.remove(path)
+        return {"message": f"File {filename} deleted successfully"}
+    raise HTTPException(status_code=404, detail=f"File {filename} not found")
 
 
 @app.post("/ask")
