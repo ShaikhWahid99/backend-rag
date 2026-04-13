@@ -176,7 +176,10 @@ class MultimodalRAG:
             else:
                 pix  = page.get_pixmap(matrix=fitz.Matrix(2, 2))
             doc.close()
-            path = f'tbl_p{page_num}_{table_idx}.png'
+            import os
+            if not os.path.exists('images'):
+                os.makedirs('images')
+            path = f'images/tbl_p{page_num}_{table_idx}.png'
             pix.save(path)
             return path
         except Exception as e:
@@ -230,6 +233,9 @@ class MultimodalRAG:
             for ii, img in enumerate(page.get_images(full=True)):
                 try:
                     base_img = doc.extract_image(img[0])
+                    import os
+                    if not os.path.exists('images'):
+                        os.makedirs('images')
                     img_path = f'images/img_p{pnum}_{ii}.png'
                     with open(img_path, 'wb') as f:
                         f.write(base_img['image'])
@@ -315,17 +321,20 @@ class MultimodalRAG:
 
         qtype = self._classify(question)
         print(f'🔎 Type: {qtype.upper()} → {MODEL}')
+        
+        image_path = None
 
         if qtype == 'image':
             target = self._find_image(question)
             if not target:
                 msg = '❌ No image found in the PDF.'
                 print(msg)
-                return msg
+                return {"answer": msg, "image_path": None}
 
             print(f'🖼️  Image from page {target["page"]} → {target["path"]}')
             print(f'   (Open {target["path"]} to view the figure)')
             print('💭 Gemini analyzing the figure...')
+            image_path = target['path']
             answer = self._call_vision(VISION_PROMPT + question, target['path'])
 
         elif qtype == 'table':
@@ -333,13 +342,14 @@ class MultimodalRAG:
             if not target:
                 msg = '❌ No table found in the PDF.'
                 print(msg)
-                return msg
+                return {"answer": msg, "image_path": None}
 
             print(f'📊 Table from page {target["page"]}')
             rendered = self._render_table(target['page'], target['idx'])
             if rendered:
                 print(f'   Table rendered → {rendered}')
                 print('💭 Gemini reading the table image...')
+                image_path = rendered
                 answer = self._call_vision(TABLE_PROMPT + question, rendered)
             else:
                 print('  ℹ️  Sending table as text (render failed)...')
@@ -361,7 +371,7 @@ class MultimodalRAG:
             if not parts:
                 msg = '❌ No relevant text found in PDF.'
                 print(msg)
-                return msg
+                return {"answer": msg, "image_path": None}
             print('💭 Gemini answering from PDF text...')
             answer = self._call_text(
                 system=TEXT_SYSTEM,
@@ -375,7 +385,7 @@ class MultimodalRAG:
         print()
         sep()
         print('💬 Answer:\n')
-        return answer
+        return {"answer": answer, "image_path": image_path}
 
 
     def show_all_images(self):

@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import shutil
 import os
@@ -16,6 +17,11 @@ app = FastAPI()
 
 if not os.path.exists("uploads"):
     os.makedirs("uploads")
+    
+if not os.path.exists("images"):
+    os.makedirs("images")
+
+app.mount("/images", StaticFiles(directory="images"), name="images")
 
 app.add_middleware(
     CORSMiddleware,
@@ -76,9 +82,12 @@ async def delete_file(filename: str):
 @app.post("/ask")
 async def ask_question(q: Question):
 
-    answer = rag.ask(q.question)
+    result = rag.ask(q.question)
+    
+    image_url = f"/{result['image_path']}" if result.get("image_path") else None
 
     return {
         "question": q.question,
-        "answer": answer
+        "answer": result["answer"],
+        "image": image_url
     }
