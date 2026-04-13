@@ -230,7 +230,7 @@ class MultimodalRAG:
             for ii, img in enumerate(page.get_images(full=True)):
                 try:
                     base_img = doc.extract_image(img[0])
-                    img_path = f'img_p{pnum}_{ii}.png'
+                    img_path = f'images/img_p{pnum}_{ii}.png'
                     with open(img_path, 'wb') as f:
                         f.write(base_img['image'])
                     snippet = text[:150] if text else ''
@@ -319,8 +319,9 @@ class MultimodalRAG:
         if qtype == 'image':
             target = self._find_image(question)
             if not target:
-                print('❌ No image found in the PDF.')
-                return
+                msg = '❌ No image found in the PDF.'
+                print(msg)
+                return msg
 
             print(f'🖼️  Image from page {target["page"]} → {target["path"]}')
             print(f'   (Open {target["path"]} to view the figure)')
@@ -330,8 +331,9 @@ class MultimodalRAG:
         elif qtype == 'table':
             target = self._find_table(question)
             if not target:
-                print('❌ No table found in the PDF.')
-                return
+                msg = '❌ No table found in the PDF.'
+                print(msg)
+                return msg
 
             print(f'📊 Table from page {target["page"]}')
             rendered = self._render_table(target['page'], target['idx'])
@@ -357,8 +359,9 @@ class MultimodalRAG:
                 if m['type'] in ('text', 'table')
             ]
             if not parts:
-                print('❌ No relevant text found in PDF.')
-                return
+                msg = '❌ No relevant text found in PDF.'
+                print(msg)
+                return msg
             print('💭 Gemini answering from PDF text...')
             answer = self._call_text(
                 system=TEXT_SYSTEM,
