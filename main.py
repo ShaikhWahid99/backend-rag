@@ -1,15 +1,18 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-import shutil
 import os
-import time
 
 from rag_engine import MultimodalRAG
-from dotenv import load_dotenv
+from db.database import engine, Base
+from routes import auth_routes, file_routes, rag_routes
 
-load_dotenv()
+
+# Initialize Database tables
+Base.metadata.create_all(bind=engine)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -33,61 +36,6 @@ app.add_middleware(
 
 rag = MultimodalRAG(api_key=GEMINI_API_KEY)
 
-
-class Question(BaseModel):
-    question: str
-
-
-@app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
-    
-    path = f"uploads/{file.filename}"
-
-    with open(path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    rag.process_pdf(path)
-
-    return {"message": "PDF processed successfully", "filename": file.filename}
-
-
-@app.get("/files")
-async def list_files():
-    files = []
-    if os.path.exists("uploads"):
-        for filename in os.listdir("uploads"):
-            path = os.path.join("uploads", filename)
-            if os.path.isfile(path):
-                stats = os.stat(path)
-                files.append({
-                    "id": filename,
-                    "filename": filename,
-                    "file_type": "pdf" if filename.lower().endswith(".pdf") else "text",
-                    "status": "indexed",
-                    "file_size": stats.st_size,
-                    "created_at": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stats.st_ctime))
-                })
-    return files
-
-
-@app.delete("/files/{filename}")
-async def delete_file(filename: str):
-    path = os.path.join("uploads", filename)
-    if os.path.exists(path):
-        os.remove(path)
-        return {"message": f"File {filename} deleted successfully"}
-    raise HTTPException(status_code=404, detail=f"File {filename} not found")
-
-
-@app.post("/ask")
-async def ask_question(q: Question):
-
-    result = rag.ask(q.question)
-    
-    image_url = f"/{result['image_path']}" if result.get("image_path") else None
-
-    return {
-        "question": q.question,
-        "answer": result["answer"],
-        "image": image_url
-    }
+app.include_router(auth_routes.router)
+app.include_router(file_routes.router)
+app.include_router(rag_routes.router)

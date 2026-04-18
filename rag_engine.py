@@ -2,10 +2,12 @@ import fitz
 import time
 import re
 import chromadb
+import uuid
 from google import genai
 from google.genai import types
 from sentence_transformers import SentenceTransformer
 from PIL import Image as PILImage
+import os
 
 MODEL = 'gemini-2.5-flash'  
 
@@ -41,10 +43,8 @@ RULES:
 7. Use bullet points for clarity.
 User question: """
 
-
 def sep(char='─', n=62):
     print(char * n)
-
 
 class MultimodalRAG:
     """
@@ -63,24 +63,18 @@ class MultimodalRAG:
         print('🔄 Loading local embedding model...')
         self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
 
-        self.chroma = chromadb.Client()
-        try:
-            self.chroma.delete_collection('rag')
-        except Exception:
-            pass
-        self.col = self.chroma.create_collection(
+        self.chroma = chromadb.PersistentClient(path="chroma_db")
+        self.col = self.chroma.get_or_create_collection(
             'rag', metadata={'hnsw:space': 'cosine'})
 
         self.images      = []  
         self.tables      = []  
         self._figure_map = {} 
         self._table_map  = {}
-        self._idx        = 0
         self._doc_path   = None
 
         print(f'✅ Ready!  Model: {MODEL}')
         print(f'   Free quota: 250 req/day · 10 RPM · 1M tokens/day')
-
 
     def _throttle(self):
         """Wait so we never exceed 10 req/min (free tier limit)."""
@@ -91,7 +85,6 @@ class MultimodalRAG:
             time.sleep(wait)
         self._last_call = time.time()
         self._call_count += 1
-
 
     def _call_text(self, system: str, user: str, retries=3) -> str:
         for attempt in range(1, retries + 1):
@@ -120,7 +113,6 @@ class MultimodalRAG:
                     time.sleep(5)
         return '❌ Rate limited. Wait 1 minute and retry.'
 
-
     def _call_vision(self, prompt: str, img_path: str, retries=3) -> str:
         pil_img = PILImage.open(img_path)
         for attempt in range(1, retries + 1):
@@ -148,20 +140,16 @@ class MultimodalRAG:
                     time.sleep(5)
         return '❌ Vision model rate limited. Wait 1 minute and retry.'
 
-
     def _embed(self, text: str) -> list:
         return self.embedder.encode(text[:2000]).tolist()
 
     def _store(self, text: str, meta: dict):
         self.col.add(
-            ids=[f'c{self._idx}'],
+            ids=[str(uuid.uuid4())],
             embeddings=[self._embed(text)],
             documents=[text],
             metadatas=[meta]
         )
-        self._idx += 1
-
-    
 
     def _render_table(self, page_num: int, table_idx: int) -> str | None:
         """Render table region from PDF as high-res PNG for vision AI."""
@@ -170,13 +158,11 @@ class MultimodalRAG:
             page = doc[page_num - 1]
             tabs = page.find_tables()
             if tabs.tables and table_idx < len(tabs.tables):
-               
                 bbox = fitz.Rect(tabs.tables[table_idx].bbox) + (-20, -20, 20, 20)
                 pix  = page.get_pixmap(matrix=fitz.Matrix(3, 3), clip=bbox)
             else:
                 pix  = page.get_pixmap(matrix=fitz.Matrix(2, 2))
             doc.close()
-            import os
             if not os.path.exists('images'):
                 os.makedirs('images')
             path = f'images/tbl_p{page_num}_{table_idx}.png'
@@ -186,8 +172,7 @@ class MultimodalRAG:
             print(f'  ⚠️  Table render failed: {e}')
             return None
 
-   
-    def process_pdf(self, path: str):
+    def process_pdf(self, path: str, user_id: int):
         print(f'\n📄 Processing: {path}\n')
         self._doc_path = path
         doc = fitz.open(path)
@@ -197,18 +182,15 @@ class MultimodalRAG:
             pnum = pn + 1
             text = page.get_text('text').strip()
 
-            
             if text:
-               
                 for m in re.finditer(r'(Figure|Fig\.?)\s*(\d+)', text, re.I):
                     self._figure_map[f'Figure {m.group(2)}'] = pnum
                 for m in re.finditer(r'Table\s*(\d+)', text, re.I):
                     key = f'Table {m.group(1)}'
                     if key not in self._table_map:
                         self._table_map[key] = pnum
-                self._store(text, {'type': 'text', 'page': str(pnum)})
+                self._store(text, {'type': 'text', 'page': str(pnum), 'user_id': str(user_id)})
 
-          
             try:
                 for ti, tab in enumerate(page.find_tables().tables):
                     rows = tab.extract()
@@ -222,18 +204,17 @@ class MultimodalRAG:
                     self._store(ttext, {
                         'type': 'table',
                         'page': str(pnum),
-                        'table_idx': str(ti)
+                        'table_idx': str(ti),
+                        'user_id': str(user_id)
                     })
                     self.tables.append({'page': pnum, 'idx': ti, 'text': ttext})
                     print(f'  📊 Table {ti+1} on page {pnum}')
             except Exception:
                 pass
 
-           
             for ii, img in enumerate(page.get_images(full=True)):
                 try:
                     base_img = doc.extract_image(img[0])
-                    import os
                     if not os.path.exists('images'):
                         os.makedirs('images')
                     img_path = f'images/img_p{pnum}_{ii}.png'
@@ -242,7 +223,7 @@ class MultimodalRAG:
                     snippet = text[:150] if text else ''
                     self._store(
                         f'[FIGURE on Page {pnum}] {snippet}',
-                        {'type': 'image', 'page': str(pnum), 'path': img_path}
+                        {'type': 'image', 'page': str(pnum), 'path': img_path, 'user_id': str(user_id)}
                     )
                     self.images.append({'page': pnum, 'path': img_path})
                     print(f'  🖼️  Image {ii+1} on page {pnum} → {img_path}')
@@ -250,12 +231,9 @@ class MultimodalRAG:
                     print(f'  ⚠️  Skip image p{pnum}: {e}')
 
         doc.close()
-        print(f'\n✅ Indexed {self.col.count()} chunks | '
-              f'{len(self.tables)} tables | {len(self.images)} images')
+        print(f'\n✅ Indexed chunks | Tables | Images')
         print(f'   Figures detected: {list(self._figure_map.keys())}')
         print(f'   Tables  detected: {list(self._table_map.keys())}')
-
-  
 
     def _classify(self, q: str) -> str:
         """Detect if question is about an image, table, or plain text."""
@@ -274,8 +252,7 @@ class MultimodalRAG:
             return 'table'
         return 'text'
 
-
-    def _find_image(self, q: str) -> dict | None:
+    def _find_image(self, q: str, user_id: str) -> dict | None:
         m = re.search(r'fig(?:ure)?[\.\s]*(\d+)', q.lower())
         if m:
             page = self._figure_map.get(f'Figure {m.group(1)}')
@@ -283,17 +260,21 @@ class MultimodalRAG:
                 imgs = [i for i in self.images if i['page'] == page]
                 if imgs:
                     return imgs[0]
+        
+        col_count = self.col.count()
+        if col_count == 0: return None
         res = self.col.query(
             query_embeddings=[self._embed(q)],
-            n_results=min(10, self.col.count())
+            n_results=min(10, col_count),
+            where={"user_id": user_id}
         )
-        for meta in res['metadatas'][0]:
-            if meta['type'] == 'image':
-                return {'page': int(meta['page']), 'path': meta['path']}
+        if len(res['metadatas']) > 0 and len(res['metadatas'][0]) > 0:
+            for meta in res['metadatas'][0]:
+                if meta['type'] == 'image':
+                    return {'page': int(meta['page']), 'path': meta['path']}
         return self.images[0] if self.images else None
 
-
-    def _find_table(self, q: str) -> dict | None:
+    def _find_table(self, q: str, user_id: str) -> dict | None:
         m = re.search(r'table\s*(\d+)', q.lower())
         if m:
             page = self._table_map.get(f'Table {m.group(1)}')
@@ -301,23 +282,27 @@ class MultimodalRAG:
                 tabs = [t for t in self.tables if t['page'] == page]
                 if tabs:
                     return tabs[0]
+                    
+        col_count = self.col.count()
+        if col_count == 0: return None
         res = self.col.query(
             query_embeddings=[self._embed(q)],
-            n_results=min(10, self.col.count())
+            n_results=min(10, col_count),
+            where={"user_id": user_id}
         )
-        for doc, meta in zip(res['documents'][0], res['metadatas'][0]):
-            if meta['type'] == 'table':
-                matches = [t for t in self.tables
-                           if str(t['page']) == meta['page']]
-                if matches:
-                    return matches[0]
+        if len(res['documents']) > 0 and len(res['documents'][0]) > 0:
+            for doc, meta in zip(res['documents'][0], res['metadatas'][0]):
+                if meta['type'] == 'table':
+                    matches = [t for t in self.tables if str(t['page']) == str(meta['page'])]
+                    if matches:
+                        return matches[0]
         return self.tables[0] if self.tables else None
 
-
-    def ask(self, question: str):
+    def ask(self, question: str, user_id: int):
         sep('═')
         print(f'❓ {question}')
         sep('═')
+        user_id_str = str(user_id)
 
         qtype = self._classify(question)
         print(f'🔎 Type: {qtype.upper()} → {MODEL}')
@@ -325,7 +310,7 @@ class MultimodalRAG:
         image_path = None
 
         if qtype == 'image':
-            target = self._find_image(question)
+            target = self._find_image(question, user_id_str)
             if not target:
                 msg = '❌ No image found in the PDF.'
                 print(msg)
@@ -338,7 +323,7 @@ class MultimodalRAG:
             answer = self._call_vision(VISION_PROMPT + question, target['path'])
 
         elif qtype == 'table':
-            target = self._find_table(question)
+            target = self._find_table(question, user_id_str)
             if not target:
                 msg = '❌ No table found in the PDF.'
                 print(msg)
@@ -359,15 +344,23 @@ class MultimodalRAG:
                 )
 
         else:
+            col_count = self.col.count()
+            if col_count == 0:
+                msg = '❌ No relevant text found in PDF.'
+                return {"answer": msg, "image_path": None}
+                
             res = self.col.query(
                 query_embeddings=[self._embed(question)],
-                n_results=min(8, self.col.count())
+                n_results=min(8, col_count),
+                where={"user_id": user_id_str}
             )
-            parts = [
-                f'--- Page {m["page"]} ({m["type"]}) ---\n{d}'
-                for d, m in zip(res['documents'][0], res['metadatas'][0])
-                if m['type'] in ('text', 'table')
-            ]
+            
+            parts = []
+            if len(res['documents']) > 0 and len(res['documents'][0]) > 0:
+                for d, m in zip(res['documents'][0], res['metadatas'][0]):
+                    if m['type'] in ('text', 'table'):
+                        parts.append(f'--- Page {m["page"]} ({m["type"]}) ---\n{d}')
+                        
             if not parts:
                 msg = '❌ No relevant text found in PDF.'
                 print(msg)
@@ -387,7 +380,6 @@ class MultimodalRAG:
         print('💬 Answer:\n')
         return {"answer": answer, "image_path": image_path}
 
-
     def show_all_images(self):
         if not self.images:
             print('No images found in PDF.')
@@ -395,7 +387,6 @@ class MultimodalRAG:
         print(f'\n📸 {len(self.images)} image(s) extracted:\n')
         for img in self.images:
             print(f'  Page {img["page"]} → {img["path"]}')
-
 
     def show_all_tables(self):
         if not self.tables:

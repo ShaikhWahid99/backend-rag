@@ -3,3 +3,7 @@ __pycache__/
 uploads/
 *.png
 .env
+
+*.sqlite3
+chroma_db/
+.DS_Store
