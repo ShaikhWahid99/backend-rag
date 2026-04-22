@@ -3,13 +3,8 @@ import time
 import re
 import chromadb
 import uuid
-from google import genai
-from google.genai import types
 from sentence_transformers import SentenceTransformer
-from PIL import Image as PILImage
 import os
-
-MODEL = 'gemini-2.5-flash'  
 
 TEXT_SYSTEM = """You are a precise document Q&A assistant.
 STRICT RULES:
@@ -55,10 +50,9 @@ class MultimodalRAG:
     TABLE  questions → Rendered table  → Gemini Vision → Analysis
     """
 
-    def __init__(self, api_key: str):
-        self.client = genai.Client(api_key=api_key)
-        self._last_call  = 0
-        self._call_count = 0
+    def __init__(self, llm_provider, fallback_provider=None):
+        self.llm = llm_provider
+        self.fallback_llm = fallback_provider
 
         print('🔄 Loading local embedding model...')
         self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
@@ -73,72 +67,32 @@ class MultimodalRAG:
         self._table_map  = {}
         self._doc_path   = None
 
-        print(f'✅ Ready!  Model: {MODEL}')
-        print(f'   Free quota: 250 req/day · 10 RPM · 1M tokens/day')
+        print(f'✅ Ready! Standard Provider Attached.')
 
-    def _throttle(self):
-        """Wait so we never exceed 10 req/min (free tier limit)."""
-        elapsed = time.time() - self._last_call
-        if elapsed < 6:
-            wait = 6 - elapsed
-            print(f'  ⏱️  Throttling {wait:.1f}s...')
-            time.sleep(wait)
-        self._last_call = time.time()
-        self._call_count += 1
 
-    def _call_text(self, system: str, user: str, retries=3) -> str:
-        for attempt in range(1, retries + 1):
-            try:
-                self._throttle()
-                r = self.client.models.generate_content(
-                    model=MODEL,
-                    contents=user,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system,
-                        max_output_tokens=1500,
-                        temperature=0.1  
-                    )
-                )
-                if r.text and len(r.text.strip()) > 20:
-                    print(f'  ✅ {MODEL} text  (call #{self._call_count})')
-                    return r.text.strip()
-                print(f'  ⚠️  Empty response attempt {attempt}')
-            except Exception as e:
-                err = str(e)
-                if '429' in err or 'quota' in err.lower() or 'RESOURCE_EXHAUSTED' in err:
-                    print(f'  ⏳ Rate limited ({attempt}/{retries}) — waiting 65s...')
-                    time.sleep(65)
-                else:
-                    print(f'  ⚠️  Attempt {attempt}: {e}')
-                    time.sleep(5)
-        return '❌ Rate limited. Wait 1 minute and retry.'
+    def _call_text(self, system: str, user: str) -> str:
+        try:
+            return self.llm.generate_text(system_prompt=system, user_prompt=user)
+        except Exception as e:
+            if self.fallback_llm:
+                print(f"  ⚠️  Primary LLM failed: {e}. Falling back to LocalLLMProvider...")
+                try:
+                    return self.fallback_llm.generate_text(system_prompt=system, user_prompt=user)
+                except Exception as fb_e:
+                    print(f"  ❌ Fallback also failed: {fb_e}")
+            return '❌ LLM query failed.'
 
-    def _call_vision(self, prompt: str, img_path: str, retries=3) -> str:
-        pil_img = PILImage.open(img_path)
-        for attempt in range(1, retries + 1):
-            try:
-                self._throttle()
-                r = self.client.models.generate_content(
-                    model=MODEL,
-                    contents=[prompt, pil_img],
-                    config=types.GenerateContentConfig(
-                        max_output_tokens=1500,
-                        temperature=0.1
-                    )
-                )
-                if r.text and len(r.text.strip()) > 20:
-                    print(f'  ✅ {MODEL} vision (call #{self._call_count})')
-                    return r.text.strip()
-                print(f'  ⚠️  Empty vision response attempt {attempt}')
-            except Exception as e:
-                err = str(e)
-                if '429' in err or 'quota' in err.lower() or 'RESOURCE_EXHAUSTED' in err:
-                    print(f'  ⏳ Rate limited ({attempt}/{retries}) — waiting 65s...')
-                    time.sleep(65)
-                else:
-                    print(f'  ⚠️  Attempt {attempt}: {e}')
-                    time.sleep(5)
-        return '❌ Vision model rate limited. Wait 1 minute and retry.'
+    def _call_vision(self, prompt: str, img_path: str) -> str:
+        try:
+            return self.llm.generate_vision(prompt=prompt, image_path=img_path)
+        except Exception as e:
+            if self.fallback_llm:
+                print(f"  ⚠️  Primary LLM vision failed: {e}. Falling back to LocalLLMProvider...")
+                try:
+                    return self.fallback_llm.generate_vision(prompt=prompt, image_path=img_path)
+                except Exception as fb_e:
+                    print(f"  ❌ Fallback vision also failed: {fb_e}")
+            return '❌ Vision model query failed.'
 
     def _embed(self, text: str) -> list:
         return self.embedder.encode(text[:2000]).tolist()
@@ -172,7 +126,7 @@ class MultimodalRAG:
             print(f'  ⚠️  Table render failed: {e}')
             return None
 
-    def process_pdf(self, path: str, user_id: int):
+    def process_pdf(self, path: str, user_id: int, file_id: int):
         print(f'\n📄 Processing: {path}\n')
         self._doc_path = path
         doc = fitz.open(path)
@@ -184,12 +138,12 @@ class MultimodalRAG:
 
             if text:
                 for m in re.finditer(r'(Figure|Fig\.?)\s*(\d+)', text, re.I):
-                    self._figure_map[f'Figure {m.group(2)}'] = pnum
+                    self._figure_map[f'{file_id}_Figure {m.group(2)}'] = pnum
                 for m in re.finditer(r'Table\s*(\d+)', text, re.I):
                     key = f'Table {m.group(1)}'
-                    if key not in self._table_map:
-                        self._table_map[key] = pnum
-                self._store(text, {'type': 'text', 'page': str(pnum), 'user_id': str(user_id)})
+                    if f"{file_id}_{key}" not in self._table_map:
+                        self._table_map[f"{file_id}_{key}"] = pnum
+                self._store(text, {'type': 'text', 'page': str(pnum), 'user_id': str(user_id), 'file_id': str(file_id)})
 
             try:
                 for ti, tab in enumerate(page.find_tables().tables):
@@ -205,9 +159,10 @@ class MultimodalRAG:
                         'type': 'table',
                         'page': str(pnum),
                         'table_idx': str(ti),
-                        'user_id': str(user_id)
+                        'user_id': str(user_id),
+                        'file_id': str(file_id)
                     })
-                    self.tables.append({'page': pnum, 'idx': ti, 'text': ttext})
+                    self.tables.append({'file_id': file_id, 'page': pnum, 'idx': ti, 'text': ttext})
                     print(f'  📊 Table {ti+1} on page {pnum}')
             except Exception:
                 pass
@@ -223,9 +178,9 @@ class MultimodalRAG:
                     snippet = text[:150] if text else ''
                     self._store(
                         f'[FIGURE on Page {pnum}] {snippet}',
-                        {'type': 'image', 'page': str(pnum), 'path': img_path, 'user_id': str(user_id)}
+                        {'type': 'image', 'page': str(pnum), 'path': img_path, 'user_id': str(user_id), 'file_id': str(file_id)}
                     )
-                    self.images.append({'page': pnum, 'path': img_path})
+                    self.images.append({'file_id': file_id, 'page': pnum, 'path': img_path})
                     print(f'  🖼️  Image {ii+1} on page {pnum} → {img_path}')
                 except Exception as e:
                     print(f'  ⚠️  Skip image p{pnum}: {e}')
@@ -252,12 +207,12 @@ class MultimodalRAG:
             return 'table'
         return 'text'
 
-    def _find_image(self, q: str, user_id: str) -> dict | None:
+    def _find_image(self, q: str, user_id: str, file_id: str) -> dict | None:
         m = re.search(r'fig(?:ure)?[\.\s]*(\d+)', q.lower())
         if m:
-            page = self._figure_map.get(f'Figure {m.group(1)}')
+            page = self._figure_map.get(f'{file_id}_Figure {m.group(1)}')
             if page:
-                imgs = [i for i in self.images if i['page'] == page]
+                imgs = [i for i in self.images if i['page'] == page and str(i.get('file_id')) == file_id]
                 if imgs:
                     return imgs[0]
         
@@ -266,7 +221,7 @@ class MultimodalRAG:
         res = self.col.query(
             query_embeddings=[self._embed(q)],
             n_results=min(10, col_count),
-            where={"user_id": user_id}
+            where={"$and": [{"user_id": user_id}, {"file_id": file_id}]}
         )
         if len(res['metadatas']) > 0 and len(res['metadatas'][0]) > 0:
             for meta in res['metadatas'][0]:
@@ -274,12 +229,12 @@ class MultimodalRAG:
                     return {'page': int(meta['page']), 'path': meta['path']}
         return self.images[0] if self.images else None
 
-    def _find_table(self, q: str, user_id: str) -> dict | None:
+    def _find_table(self, q: str, user_id: str, file_id: str) -> dict | None:
         m = re.search(r'table\s*(\d+)', q.lower())
         if m:
-            page = self._table_map.get(f'Table {m.group(1)}')
+            page = self._table_map.get(f'{file_id}_Table {m.group(1)}')
             if page:
-                tabs = [t for t in self.tables if t['page'] == page]
+                tabs = [t for t in self.tables if t['page'] == page and str(t.get('file_id')) == file_id]
                 if tabs:
                     return tabs[0]
                     
@@ -288,7 +243,7 @@ class MultimodalRAG:
         res = self.col.query(
             query_embeddings=[self._embed(q)],
             n_results=min(10, col_count),
-            where={"user_id": user_id}
+            where={"$and": [{"user_id": user_id}, {"file_id": file_id}]}
         )
         if len(res['documents']) > 0 and len(res['documents'][0]) > 0:
             for doc, meta in zip(res['documents'][0], res['metadatas'][0]):
@@ -298,19 +253,19 @@ class MultimodalRAG:
                         return matches[0]
         return self.tables[0] if self.tables else None
 
-    def ask(self, question: str, user_id: int):
+    def ask(self, question: str, user_id: int, file_id: int):
         sep('═')
         print(f'❓ {question}')
         sep('═')
         user_id_str = str(user_id)
 
         qtype = self._classify(question)
-        print(f'🔎 Type: {qtype.upper()} → {MODEL}')
+        print(f'🔎 Type: {qtype.upper()}')
         
         image_path = None
 
         if qtype == 'image':
-            target = self._find_image(question, user_id_str)
+            target = self._find_image(question, user_id_str, str(file_id))
             if not target:
                 msg = '❌ No image found in the PDF.'
                 print(msg)
@@ -323,7 +278,7 @@ class MultimodalRAG:
             answer = self._call_vision(VISION_PROMPT + question, target['path'])
 
         elif qtype == 'table':
-            target = self._find_table(question, user_id_str)
+            target = self._find_table(question, user_id_str, str(file_id))
             if not target:
                 msg = '❌ No table found in the PDF.'
                 print(msg)
@@ -352,7 +307,7 @@ class MultimodalRAG:
             res = self.col.query(
                 query_embeddings=[self._embed(question)],
                 n_results=min(8, col_count),
-                where={"user_id": user_id_str}
+                where={"$and": [{"user_id": user_id_str}, {"file_id": str(file_id)}]}
             )
             
             parts = []

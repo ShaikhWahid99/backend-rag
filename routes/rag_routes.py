@@ -17,7 +17,12 @@ async def ask_question(
     db: Session = Depends(get_db)
 ):
     from main import rag
-    result = rag.ask(q.question, current_user.id)
+    from db.models import File as DBFile
+    
+    latest_file = db.query(DBFile).filter(DBFile.user_id == current_user.id).order_by(DBFile.created_at.desc()).first()
+    file_id = latest_file.id if latest_file else -1
+    
+    result = rag.ask(q.question, current_user.id, file_id)
     
     image_url = f"/{result['image_path']}" if result.get("image_path") else None
     

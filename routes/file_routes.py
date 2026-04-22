@@ -23,12 +23,13 @@ async def upload_pdf(
     with open(path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    from main import rag
-    rag.process_pdf(path, current_user.id)
-    
     db_file = DBFile(user_id=current_user.id, filename=file.filename, filepath=path)
     db.add(db_file)
     db.commit()
+    db.refresh(db_file)
+
+    from main import rag
+    rag.process_pdf(path, current_user.id, db_file.id)
 
     return {"message": "PDF processed successfully", "filename": file.filename}
 

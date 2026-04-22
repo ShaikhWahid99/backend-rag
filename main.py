@@ -7,14 +7,27 @@ from fastapi.staticfiles import StaticFiles
 import os
 
 from rag_engine import MultimodalRAG
+from llm import GeminiProvider, OpenAIProvider, LocalLLMProvider
 from db.database import engine, Base
 from routes import auth_routes, file_routes, rag_routes
 
 
-# Initialize Database tables
 Base.metadata.create_all(bind=engine)
 
+LLM_PROVIDER_TYPE = os.getenv("LLM_PROVIDER", "gemini").lower()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if LLM_PROVIDER_TYPE == "openai":
+    primary_llm = OpenAIProvider(api_key=OPENAI_API_KEY)
+elif LLM_PROVIDER_TYPE == "local":
+    primary_llm = LocalLLMProvider()
+else:
+    primary_llm = GeminiProvider(api_key=GEMINI_API_KEY)
+
+# Automatic fallback to local if primary is not local
+# fallback_llm = LocalLLMProvider() if LLM_PROVIDER_TYPE != "local" else None
+fallback_llm = LocalLLMProvider(text_model="llama3.2:1b", vision_model="moondream") if LLM_PROVIDER_TYPE != "local" else None
 
 app = FastAPI()
 
@@ -34,7 +47,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-rag = MultimodalRAG(api_key=GEMINI_API_KEY)
+rag = MultimodalRAG(llm_provider=primary_llm, fallback_provider=fallback_llm)
 
 app.include_router(auth_routes.router)
 app.include_router(file_routes.router)
