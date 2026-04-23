@@ -31,7 +31,7 @@ async def upload_pdf(
     from main import rag
     rag.process_pdf(path, current_user.id, db_file.id)
 
-    return {"message": "PDF processed successfully", "filename": file.filename}
+    return {"message": "PDF processed successfully", "filename": file.filename, "id": db_file.id}
 
 @router.get("/files")
 async def list_files(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
