@@ -5,6 +5,28 @@ import chromadb
 import uuid
 from sentence_transformers import SentenceTransformer
 import os
+import pytesseract
+from PIL import Image
+import io
+
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+def recursive_text_split(text: str, chunk_size=400, overlap=100) -> list:
+    chunks = []
+    start = 0
+    text_len = len(text)
+    while start < text_len:
+        end = start + chunk_size
+        if end < text_len:
+            split_idx = text.rfind('\n', start, end)
+            if split_idx == -1 or split_idx <= start + (chunk_size // 2):
+                split_idx = text.rfind(' ', start, end)
+            if split_idx != -1 and split_idx > start:
+                end = split_idx
+        chunks.append(text[start:end].strip())
+        start = end - overlap if end < text_len else text_len
+        if start < 0: start = 0
+    return [c for c in chunks if c]
 
 TEXT_SYSTEM = """You are a precise document Q&A assistant.
 STRICT RULES:
@@ -143,7 +165,26 @@ class MultimodalRAG:
                     key = f'Table {m.group(1)}'
                     if f"{file_id}_{key}" not in self._table_map:
                         self._table_map[f"{file_id}_{key}"] = pnum
-                self._store(text, {'type': 'text', 'page': str(pnum), 'user_id': str(user_id), 'file_id': str(file_id)})
+                for chunk in recursive_text_split(text):
+                    self._store(chunk, {'type': 'text', 'page': str(pnum), 'user_id': str(user_id), 'file_id': str(file_id)})
+                    
+            elif len(text) < 50:
+                ocr_text_full = ""
+                for ii, img in enumerate(page.get_images(full=True)):
+                    try:
+                        base_img = doc.extract_image(img[0])
+                        image_bytes = base_img['image']
+                        image_pil = Image.open(io.BytesIO(image_bytes))
+                        ocr_text = pytesseract.image_to_string(image_pil).strip()
+                        if ocr_text:
+                            ocr_text_full += ocr_text + "\n"
+                    except Exception as e:
+                        print(f"  ⚠️ OCR failed on p{pnum} img {ii}: {e}")
+                
+                if ocr_text_full.strip():
+                    text = ocr_text_full.strip()
+                    for chunk in recursive_text_split(ocr_text_full):
+                        self._store(chunk, {'type': 'ocr_text', 'page': str(pnum), 'user_id': str(user_id), 'file_id': str(file_id)})
 
             try:
                 for ti, tab in enumerate(page.find_tables().tables):
@@ -175,7 +216,7 @@ class MultimodalRAG:
                     img_path = f'images/img_p{pnum}_{ii}.png'
                     with open(img_path, 'wb') as f:
                         f.write(base_img['image'])
-                    snippet = text[:150] if text else ''
+                    snippet = text[:200] if text else ''
                     self._store(
                         f'[FIGURE on Page {pnum}] {snippet}',
                         {'type': 'image', 'page': str(pnum), 'path': img_path, 'user_id': str(user_id), 'file_id': str(file_id)}
@@ -207,27 +248,34 @@ class MultimodalRAG:
             return 'table'
         return 'text'
 
-    def _find_image(self, q: str, user_id: str, file_id: str) -> dict | None:
+    def _find_images(self, q: str, user_id: str, file_id: str) -> list:
+        top_images = []
         m = re.search(r'fig(?:ure)?[\.\s]*(\d+)', q.lower())
         if m:
             page = self._figure_map.get(f'{file_id}_Figure {m.group(1)}')
             if page:
                 imgs = [i for i in self.images if i['page'] == page and str(i.get('file_id')) == file_id]
-                if imgs:
-                    return imgs[0]
+                for img in imgs:
+                    if img not in top_images: top_images.append(img)
+                    if len(top_images) >= 3: return top_images
         
         col_count = self.col.count()
-        if col_count == 0: return None
+        if col_count == 0: return top_images
         res = self.col.query(
             query_embeddings=[self._embed(q)],
-            n_results=min(10, col_count),
+            n_results=min(15, col_count),
             where={"$and": [{"user_id": user_id}, {"file_id": file_id}]}
         )
         if len(res['metadatas']) > 0 and len(res['metadatas'][0]) > 0:
             for meta in res['metadatas'][0]:
                 if meta['type'] == 'image':
-                    return {'page': int(meta['page']), 'path': meta['path']}
-        return self.images[0] if self.images else None
+                    img_dict = {'page': int(meta['page']), 'path': meta['path']}
+                    if img_dict not in top_images:
+                        top_images.append(img_dict)
+                    if len(top_images) >= 3: break
+        if not top_images and self.images:
+            top_images.append(self.images[0])
+        return top_images
 
     def _find_table(self, q: str, user_id: str, file_id: str) -> dict | None:
         m = re.search(r'table\s*(\d+)', q.lower())
@@ -262,34 +310,36 @@ class MultimodalRAG:
         qtype = self._classify(question)
         print(f'🔎 Type: {qtype.upper()}')
         
-        image_path = None
+        image_paths = []
 
         if qtype == 'image':
-            target = self._find_image(question, user_id_str, str(file_id))
-            if not target:
+            targets = self._find_images(question, user_id_str, str(file_id))
+            if not targets:
                 msg = '❌ No image found in the PDF.'
                 print(msg)
-                return {"answer": msg, "image_path": None}
+                return {"answer": msg, "image_paths": []}
 
-            print(f'🖼️  Image from page {target["page"]} → {target["path"]}')
-            print(f'   (Open {target["path"]} to view the figure)')
-            print('💭 Gemini analyzing the figure...')
-            image_path = target['path']
-            answer = self._call_vision(VISION_PROMPT + question, target['path'])
+            answer = ""
+            for idx, target in enumerate(targets):
+                print(f'🖼️  Image from page {target["page"]} → {target["path"]}')
+                image_paths.append(target['path'])
+                ans = self._call_vision(VISION_PROMPT + question, target['path'])
+                answer += f"**Figure {idx+1} (Page {target['page']}):**\n{ans}\n\n"
+            answer = answer.strip()
 
         elif qtype == 'table':
             target = self._find_table(question, user_id_str, str(file_id))
             if not target:
                 msg = '❌ No table found in the PDF.'
                 print(msg)
-                return {"answer": msg, "image_path": None}
+                return {"answer": msg, "image_paths": []}
 
             print(f'📊 Table from page {target["page"]}')
             rendered = self._render_table(target['page'], target['idx'])
             if rendered:
                 print(f'   Table rendered → {rendered}')
                 print('💭 Gemini reading the table image...')
-                image_path = rendered
+                image_paths.append(rendered)
                 answer = self._call_vision(TABLE_PROMPT + question, rendered)
             else:
                 print('  ℹ️  Sending table as text (render failed)...')
@@ -302,24 +352,25 @@ class MultimodalRAG:
             col_count = self.col.count()
             if col_count == 0:
                 msg = '❌ No relevant text found in PDF.'
-                return {"answer": msg, "image_path": None}
+                return {"answer": msg, "image_paths": []}
                 
             res = self.col.query(
                 query_embeddings=[self._embed(question)],
-                n_results=min(8, col_count),
+                n_results=min(15, col_count),
                 where={"$and": [{"user_id": user_id_str}, {"file_id": str(file_id)}]}
             )
             
             parts = []
             if len(res['documents']) > 0 and len(res['documents'][0]) > 0:
                 for d, m in zip(res['documents'][0], res['metadatas'][0]):
-                    if m['type'] in ('text', 'table'):
+                    if m['type'] in ('text', 'ocr_text', 'table'):
                         parts.append(f'--- Page {m["page"]} ({m["type"]}) ---\n{d}')
                         
             if not parts:
-                msg = '❌ No relevant text found in PDF.'
+                print('  ℹ️  No strong chunks found, expanding search...')
+                msg = '❌ The specific information could not be found with high confidence in this document.'
                 print(msg)
-                return {"answer": msg, "image_path": None}
+                return {"answer": msg, "image_paths": []}
             print('💭 Gemini answering from PDF text...')
             answer = self._call_text(
                 system=TEXT_SYSTEM,
@@ -333,7 +384,7 @@ class MultimodalRAG:
         print()
         sep()
         print('💬 Answer:\n')
-        return {"answer": answer, "image_path": image_path}
+        return {"answer": answer, "image_paths": image_paths}
 
     def show_all_images(self):
         if not self.images:

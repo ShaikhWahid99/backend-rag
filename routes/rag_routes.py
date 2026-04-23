@@ -24,7 +24,8 @@ async def ask_question(
     
     result = rag.ask(q.question, current_user.id, file_id)
     
-    image_url = f"/{result['image_path']}" if result.get("image_path") else None
+    image_paths = result.get("image_paths", [])
+    image_urls = [f"/{img}" for img in image_paths] if image_paths else None
     
     query_history = QueryHistory(
         user_id=current_user.id,
@@ -37,5 +38,5 @@ async def ask_question(
     return {
         "question": q.question,
         "answer": result["answer"],
-        "image": image_url
+        "images": image_urls
     }
